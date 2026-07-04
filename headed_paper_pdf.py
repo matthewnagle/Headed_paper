@@ -1,27 +1,37 @@
 """Headed Paper PDF Generator.
 
 Tkinter desktop app that reads a clinic Excel export, overlays patient
-details onto the letterhead template, and saves one combined PDF.
+details onto the letterhead template, and prints the patient sheets.
+
+Workflow: select the Excel file -> the PDF is generated into a temporary
+folder -> press Print -> the pages are sent to the chosen printer -> the
+app deletes the temporary data and closes. Nothing is left on disk.
 
 Packaged as a standalone Windows executable with PyInstaller (see
 build_windows.bat / headed_paper.spec). The letterhead.pdf template is
-bundled inside the executable.
+bundled inside the executable. Printing uses the Windows print spooler
+directly (pywin32), so no PDF reader needs to be installed.
 """
 
 import io
 import os
 import re
+import shutil
 import sys
+import tempfile
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import fitz  # PyMuPDF
 import pandas as pd
 import qrcode
+from PIL import Image
+
 import xlrd
 
-APP_TITLE = "PDF Form Generator"
+APP_TITLE = "Patient Sheet Printer"
 TEMPLATE_FILENAME = "letterhead.pdf"
+PRINT_DPI = 300
 
 
 def resource_path(filename):
@@ -126,55 +136,185 @@ def generate_pdf(file_path, pdf_template_path, output_directory):
         pdf_document.close()
 
     combined_pdf.save(combined_pdf_path)
+    page_count = combined_pdf.page_count
     combined_pdf.close()
-    return combined_pdf_path
+    return combined_pdf_path, page_count
 
 
-def select_file():
-    file_path = filedialog.askopenfilename(
-        title="Select Excel File",
-        filetypes=(("Excel files", "*.xls *.xlsx"), ("All files", "*.*")),
-    )
-    if not file_path:
-        return
-
-    output_directory = filedialog.askdirectory(title="Select Folder to Save PDF")
-    if not output_directory:
-        return
-
-    pdf_template_path = find_template()
-    if not pdf_template_path:
-        messagebox.showerror(
-            "Error", "letterhead.pdf template not found. Cannot generate PDF."
-        )
-        return
-
+def pdf_page_images(pdf_path, dpi=PRINT_DPI):
+    """Render each PDF page to a PIL image, ready to send to the printer."""
+    doc = fitz.open(pdf_path)
     try:
-        combined_pdf_path = generate_pdf(file_path, pdf_template_path, output_directory)
-        messagebox.showinfo(
-            "Success",
-            f"Combined PDF file created successfully! Saved as {combined_pdf_path}",
+        for page in doc:
+            pix = page.get_pixmap(dpi=dpi)
+            yield Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    finally:
+        doc.close()
+
+
+def list_printers():
+    import win32print
+
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    printers = [p[2] for p in win32print.EnumPrinters(flags)]
+    default = win32print.GetDefaultPrinter()
+    return printers, default
+
+
+def print_pdf(pdf_path, printer_name, job_name="OPD Patient Sheets"):
+    """Send every page of the PDF to the printer via the Windows spooler."""
+    import win32ui
+    from PIL import ImageWin
+
+    hdc = win32ui.CreateDC()
+    hdc.CreatePrinterDC(printer_name)
+    printable_w = hdc.GetDeviceCaps(8)  # HORZRES
+    printable_h = hdc.GetDeviceCaps(10)  # VERTRES
+
+    hdc.StartDoc(job_name)
+    try:
+        for img in pdf_page_images(pdf_path):
+            scale = min(printable_w / img.width, printable_h / img.height)
+            w, h = int(img.width * scale), int(img.height * scale)
+            x = (printable_w - w) // 2
+            y = (printable_h - h) // 2
+            hdc.StartPage()
+            ImageWin.Dib(img).draw(hdc.GetHandleOutput(), (x, y, x + w, y + h))
+            hdc.EndPage()
+    except Exception:
+        hdc.AbortDoc()
+        raise
+    else:
+        hdc.EndDoc()
+    finally:
+        hdc.DeleteDC()
+
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.root.geometry("420x220")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.temp_dir = None
+        self.pdf_path = None
+        self.page_count = 0
+
+        self.status = tk.StringVar(value="Select the clinic Excel file to begin.")
+        tk.Label(self.root, textvariable=self.status, wraplength=380).pack(pady=(16, 8))
+
+        self.select_button = tk.Button(
+            self.root, text="1. Select Excel File", command=self.select_file, width=32
         )
-    except Exception as e:
-        messagebox.showerror("Error", f"An error occurred: {e}")
+        self.select_button.pack(pady=4)
+
+        printer_row = tk.Frame(self.root)
+        printer_row.pack(pady=4)
+        tk.Label(printer_row, text="Printer:").pack(side=tk.LEFT, padx=(0, 6))
+        self.printer_box = ttk.Combobox(printer_row, width=34, state="readonly")
+        self.printer_box.pack(side=tk.LEFT)
+        self.load_printers()
+
+        self.print_button = tk.Button(
+            self.root,
+            text="2. Print pages",
+            command=self.print_pages,
+            width=32,
+            state=tk.DISABLED,
+        )
+        self.print_button.pack(pady=4)
+
+    def load_printers(self):
+        try:
+            printers, default = list_printers()
+            self.printer_box["values"] = printers
+            if default in printers:
+                self.printer_box.set(default)
+            elif printers:
+                self.printer_box.set(printers[0])
+        except Exception:
+            self.printer_box["values"] = []
+
+    def select_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Excel File",
+            filetypes=(("Excel files", "*.xls *.xlsx"), ("All files", "*.*")),
+        )
+        if not file_path:
+            return
+
+        pdf_template_path = find_template()
+        if not pdf_template_path:
+            messagebox.showerror(
+                "Error", "letterhead.pdf template not found. Cannot generate pages."
+            )
+            return
+
+        self.cleanup_temp()
+        try:
+            self.temp_dir = tempfile.mkdtemp(prefix="headed_paper_")
+            self.pdf_path, self.page_count = generate_pdf(
+                file_path, pdf_template_path, self.temp_dir
+            )
+        except Exception as e:
+            self.cleanup_temp()
+            messagebox.showerror("Error", f"An error occurred: {e}")
+            return
+
+        self.status.set(
+            f"{self.page_count} patient sheet(s) ready. "
+            "Choose a printer and press Print."
+        )
+        self.print_button.config(
+            text=f"2. Print {self.page_count} page(s)", state=tk.NORMAL
+        )
+
+    def print_pages(self):
+        printer_name = self.printer_box.get()
+        if not printer_name:
+            messagebox.showerror("Error", "No printer selected.")
+            return
+
+        self.status.set(f"Printing to {printer_name}…")
+        self.print_button.config(state=tk.DISABLED)
+        self.select_button.config(state=tk.DISABLED)
+        self.root.update_idletasks()
+
+        try:
+            print_pdf(self.pdf_path, printer_name)
+        except Exception as e:
+            self.print_button.config(state=tk.NORMAL)
+            self.select_button.config(state=tk.NORMAL)
+            self.status.set("Printing failed. Try again or pick another printer.")
+            messagebox.showerror("Error", f"Printing failed: {e}")
+            return
+
+        messagebox.showinfo(
+            "Done",
+            f"{self.page_count} page(s) sent to {printer_name}. "
+            "The app will now close and delete the data.",
+        )
+        self.close()
+
+    def cleanup_temp(self):
+        if self.temp_dir:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.temp_dir = None
+        self.pdf_path = None
+        self.page_count = 0
+
+    def close(self):
+        self.cleanup_temp()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
 
 
 def main():
-    app = tk.Tk()
-    app.title(APP_TITLE)
-    app.geometry("360x120")
-    app.resizable(False, False)
-
-    select_file_button = tk.Button(
-        app,
-        text="Select Excel File and Generate PDF",
-        command=select_file,
-        padx=12,
-        pady=8,
-    )
-    select_file_button.pack(expand=True, pady=20)
-
-    app.mainloop()
+    App().run()
 
 
 if __name__ == "__main__":
