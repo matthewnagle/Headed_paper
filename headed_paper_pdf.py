@@ -181,13 +181,49 @@ def list_printers():
     return printers, default
 
 
-def print_pdf(pdf_path, printer_name, job_name="OPD Patient Sheets"):
-    """Send every page of the PDF to the printer via the Windows spooler."""
-    import win32ui
-    from PIL import ImageWin
+def _printer_dc(printer_name):
+    """Create a printer DC forced to single-sided, one copy per page.
 
+    Without this the job inherits the driver defaults, so printers set up
+    for duplex put two patient sheets on one piece of paper.
+    """
+    import win32gui
+    import win32print
+    import win32ui
+
+    DM_DUPLEX = 0x1000
+    DM_COPIES = 0x100
+    DMDUP_SIMPLEX = 1
+
+    devmode = None
+    try:
+        hprinter = win32print.OpenPrinter(printer_name)
+        try:
+            devmode = win32print.GetPrinter(hprinter, 2)["pDevMode"]
+        finally:
+            win32print.ClosePrinter(hprinter)
+        if devmode is not None:
+            devmode.Duplex = DMDUP_SIMPLEX
+            devmode.Copies = 1
+            devmode.Fields = devmode.Fields | DM_DUPLEX | DM_COPIES
+    except Exception:
+        devmode = None
+
+    if devmode is not None:
+        return win32ui.CreateDCFromHandle(
+            win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+        )
+    # Fall back to driver defaults if the devmode could not be read.
     hdc = win32ui.CreateDC()
     hdc.CreatePrinterDC(printer_name)
+    return hdc
+
+
+def print_pdf(pdf_path, printer_name, job_name="OPD Patient Sheets"):
+    """Send every page of the PDF to the printer via the Windows spooler."""
+    from PIL import ImageWin
+
+    hdc = _printer_dc(printer_name)
     printable_w = hdc.GetDeviceCaps(8)  # HORZRES
     printable_h = hdc.GetDeviceCaps(10)  # VERTRES
 
