@@ -31,7 +31,8 @@ import xlrd
 
 APP_TITLE = "Patient Sheet Printer"
 TEMPLATE_FILENAME = "letterhead.pdf"
-PRINT_DPI = 300
+# Upper bound on render resolution; keeps memory sane on 1200 dpi drivers.
+MAX_PRINT_DPI = 600
 
 
 def resource_path(filename):
@@ -161,13 +162,18 @@ def generate_pdf(file_path, pdf_template_path, output_directory):
     return combined_pdf_path, page_count
 
 
-def pdf_page_images(pdf_path, dpi=PRINT_DPI):
+def render_page_image(page, zoom):
+    """Render one PDF page to a PIL image at `zoom` pixels per PDF point."""
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
+def pdf_page_images(pdf_path, dpi=MAX_PRINT_DPI):
     """Render each PDF page to a PIL image, ready to send to the printer."""
     doc = fitz.open(pdf_path)
     try:
         for page in doc:
-            pix = page.get_pixmap(dpi=dpi)
-            yield Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            yield render_page_image(page, dpi / 72)
     finally:
         doc.close()
 
@@ -227,11 +233,17 @@ def print_pdf(pdf_path, printer_name, job_name="OPD Patient Sheets"):
     printable_w = hdc.GetDeviceCaps(8)  # HORZRES
     printable_h = hdc.GetDeviceCaps(10)  # VERTRES
 
+    doc = fitz.open(pdf_path)
     hdc.StartDoc(job_name)
     try:
-        for img in pdf_page_images(pdf_path):
-            scale = min(printable_w / img.width, printable_h / img.height)
-            w, h = int(img.width * scale), int(img.height * scale)
+        for page in doc:
+            rect = page.rect
+            # Pixels per PDF point so the page fills the printable area,
+            # rendered at the printer's own resolution (capped) so the
+            # image maps onto printer pixels without blurry rescaling.
+            zoom = min(printable_w / rect.width, printable_h / rect.height)
+            img = render_page_image(page, min(zoom, MAX_PRINT_DPI / 72))
+            w, h = int(rect.width * zoom), int(rect.height * zoom)
             x = (printable_w - w) // 2
             y = (printable_h - h) // 2
             hdc.StartPage()
@@ -244,6 +256,7 @@ def print_pdf(pdf_path, printer_name, job_name="OPD Patient Sheets"):
         hdc.EndDoc()
     finally:
         hdc.DeleteDC()
+        doc.close()
 
 
 class App:
