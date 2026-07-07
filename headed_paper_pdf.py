@@ -56,12 +56,32 @@ def find_template():
     )
 
 
+def _xls_cell_value(sheet, row, col, datemode):
+    cell = sheet.cell(row, col)
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        return xlrd.xldate_as_datetime(cell.value, datemode).strftime("%d/%m/%Y")
+    if cell.ctype == xlrd.XL_CELL_NUMBER and cell.value == int(cell.value):
+        return int(cell.value)  # keep MRNs as 12345678, not 12345678.0
+    return cell.value
+
+
 def process_excel_file(file_path):
+    columns = [4, 6, 8, 10]
     if file_path.lower().endswith(".xls"):
+        # pandas no longer accepts an xlrd Book object, and going through
+        # pandas' own xlrd engine would lose ignore_workbook_corruption,
+        # which the clinic exports need - so read the sheet directly.
         book = xlrd.open_workbook_xls(file_path, ignore_workbook_corruption=True)
-        df = pd.read_excel(book, skiprows=4, usecols=[4, 6, 8, 10])
+        sheet = book.sheet_by_index(0)
+        headers = [str(sheet.cell_value(4, c)).strip() for c in columns]
+        rows = []
+        for r in range(5, sheet.nrows):
+            values = [_xls_cell_value(sheet, r, c, book.datemode) for c in columns]
+            if any(str(v).strip() for v in values):
+                rows.append(values)
+        df = pd.DataFrame(rows, columns=headers)
     else:
-        df = pd.read_excel(file_path, skiprows=4, usecols=[4, 6, 8, 10])
+        df = pd.read_excel(file_path, skiprows=4, usecols=columns)
     return df.fillna("")
 
 
